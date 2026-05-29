@@ -4,7 +4,6 @@ import json
 import os
 import sys
 import tempfile
-import tracemalloc
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -125,49 +124,62 @@ class TestEvictStaleDataInputTxs(unittest.TestCase):
         evicted = self.db._evict_stale_data_input_txs(["spent_box"])
         self.assertEqual(evicted, 0)
 
-    def test_cursor_iteration_bounded_memory(self):
-        """_evict_stale_data_input_txs() does not load the entire pool into RAM."""
-        n_txs = 20
-        tx_size = 50_000  # 50 KB per tx → 1 MB total pool
-        total_pool_bytes = n_txs * tx_size
-        padding = "x" * tx_size
+    def test_cursor_iteration_no_fetchall(self):
+        """_evict_stale_data_input_txs() must not call fetchall() on the full mempool scan."""
+        _seed_mempool(self.db, [
+            {"tx_id": "tx_a", "data_inputs": ["box_1"]},
+            {"tx_id": "tx_b", "data_inputs": ["box_2"]},
+        ])
 
-        conn = self.db._conn()
-        try:
-            for i in range(n_txs):
-                tx_id = f"tx_{i:06d}"
-                tx_data = json.dumps({
-                    "tx_id": tx_id,
-                    "data_inputs": [],
-                    "pad": padding,
-                })
-                conn.execute(
-                    "INSERT INTO utxo_mempool VALUES (?,?,0,0,9999999999)",
-                    (tx_id, tx_data),
+        fetchall_violations = []
+
+        class _SpyCursor:
+            def __init__(self, real_cursor, is_full_scan):
+                self._real = real_cursor
+                self._is_full_scan = is_full_scan
+
+            def fetchall(self):
+                if self._is_full_scan:
+                    fetchall_violations.append("fetchall() on full utxo_mempool scan")
+                return self._real.fetchall()
+
+            def __iter__(self):
+                return iter(self._real)
+
+            def __next__(self):
+                return next(self._real)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        class _SpyConnection:
+            def __init__(self, real_conn):
+                self._real = real_conn
+
+            def execute(self, sql, params=()):
+                real_cursor = self._real.execute(sql, params)
+                is_full_scan = (
+                    "FROM utxo_mempool" in sql
+                    and "WHERE" not in sql.upper()
                 )
-            conn.commit()
-        finally:
-            conn.close()
+                return _SpyCursor(real_cursor, is_full_scan)
 
-        tracemalloc.start()
-        snap_before = tracemalloc.take_snapshot()
+            def __getattr__(self, name):
+                return getattr(self._real, name)
 
-        # None of the pooled txs reference "phantom_box" so nothing is evicted,
-        # but the full table is scanned — this exercises the iteration path.
-        self.db._evict_stale_data_input_txs(["phantom_box"])
+        real_conn_factory = self.db._conn
 
-        snap_after = tracemalloc.take_snapshot()
-        tracemalloc.stop()
+        def spy_conn_factory():
+            return _SpyConnection(real_conn_factory())
 
-        stats = snap_after.compare_to(snap_before, "lineno")
-        delta_bytes = sum(s.size_diff for s in stats if s.size_diff > 0)
+        self.db._conn = spy_conn_factory
 
-        # Memory delta must stay well below 50% of total pool size.
-        self.assertLess(
-            delta_bytes, total_pool_bytes * 0.5,
-            f"Memory delta {delta_bytes / 1024:.1f} KB exceeds 50% of "
-            f"pool size {total_pool_bytes / 1024:.1f} KB — "
-            f"cursor iteration may have regressed to fetchall()",
+        self.db._evict_stale_data_input_txs(["box_1"])
+
+        self.assertEqual(
+            fetchall_violations, [],
+            "fetchall() called on the full utxo_mempool scan — "
+            "OOM regression: the fix must use cursor iteration",
         )
 
 
