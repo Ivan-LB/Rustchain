@@ -7,11 +7,14 @@ submissions that remain stuck in 'verifying'.
 Before fix: query had no LIMIT clause.
 After fix:  query adds LIMIT 500 (_VERIFYING_CLAIMS_LIMIT).
 """
+import os
 import sqlite3
+import sys
+import tempfile
 import time
 import unittest
-import tempfile
-import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from claims_settlement import get_verifying_claims, _VERIFYING_CLAIMS_LIMIT
 
@@ -51,9 +54,8 @@ def _insert_claims(path: str, count: int, status: str = "verifying", ts_offset: 
 class TestVerifyingClaimsLimit(unittest.TestCase):
 
     def setUp(self):
-        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        self.db_path = self.tmp.name
-        self.tmp.close()
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
         _make_db(self.db_path)
 
     def tearDown(self):
